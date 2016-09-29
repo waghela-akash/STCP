@@ -8,8 +8,8 @@
  * functionality in this file. 
  *
  */
-
-
+#include <time.h>
+#include <ctime>
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
@@ -23,7 +23,7 @@
 
 enum { CSTATE_ESTABLISHED, FIN_SENT, FIN_RECEIVED, CLOSED };    /* you should have more states */
 
-#define debug 0
+#define debug 1
 int window_size = 3072;
 int max_payload_len = STCP_MSS;
 int MAX_IP_PAYLOAD_LEN = 1500;
@@ -40,7 +40,8 @@ typedef struct
     int congestion_window_size;
     int sender_window_size;
 
-    int last_ack_byte;
+    int last_ack_sent;
+    int last_ack_received;
     int last_sent_byte;
     /* any other connection-wide global variables go here */
 } context_t;
@@ -68,7 +69,7 @@ void transport_init(mysocket_t sd, bool_t is_active)
 
     ctx = (context_t *) calloc(1, sizeof(context_t));
     assert(ctx);
-
+    
     generate_initial_seq_num(ctx);
     ctx->congestion_window_size = window_size;
     ctx->sender_window_size = window_size;
@@ -112,8 +113,9 @@ void transport_init(mysocket_t sd, bool_t is_active)
                     stcp_network_send(sd,&ackHeader,sizeof(ackHeader),NULL);
 
                     ctx->sequence_num = ctx->initial_sequence_num + 1; 
-                    ctx->last_ack_byte = ctx->sequence_num;
-                    ctx->last_sent_byte = ctx->initial_sequence_num; 
+                    ctx->last_ack_sent = recvSynAckHeader->th_seq + 1;
+                    ctx->last_sent_byte = ctx->initial_sequence_num;
+                    ctx->last_ack_received = ctx->sequence_num;   
                 }
                 else{
                     printf("Active Ack Mismatch\n");
@@ -170,8 +172,9 @@ void transport_init(mysocket_t sd, bool_t is_active)
                         exit(0);
                     }
                     ctx->sequence_num = ctx->initial_sequence_num + 1;
-                    ctx->last_ack_byte = ctx->sequence_num;
+                    ctx->last_ack_sent = recvSynHeader->th_seq + 1;
                     ctx->last_sent_byte = ctx->initial_sequence_num;
+                    ctx->last_ack_received = ctx->sequence_num;
                 }
                 else{
                     printf("Passive Flag Mismatch\n");
@@ -205,8 +208,8 @@ static void generate_initial_seq_num(context_t *ctx)
     /* please don't change this! */
     ctx->initial_sequence_num = 1;
 #else
-    /* you have to fill this up */
-    srand((unsigned)time(NULL));
+    /* you have to fill this up */ 
+    srand(time(NULL));   
     ctx->initial_sequence_num = 15;//rand()%256;
 #endif
 }
@@ -239,7 +242,8 @@ static void control_loop(mysocket_t sd, context_t *ctx)
             printf("-----------> New Event Type %d <-----------\n",event);
             printf("Curr State %d\n",ctx->connection_state);
             printf("Curr Seq Number %d\n",ctx->sequence_num);
-            printf("LSB: %d LAB: %d\n",ctx->last_sent_byte,ctx->last_ack_byte);
+            printf("LAR: %d LSB: %d LAS: %d\n",
+                ctx->last_ack_received,ctx->last_sent_byte,ctx->last_ack_sent);
         } 
             
 
@@ -270,7 +274,7 @@ static void control_loop(mysocket_t sd, context_t *ctx)
             msgHeader.th_seq = ctx->sequence_num;
             msgHeader.th_off = sizeof(msgHeader)/4;
             msgHeader.th_win = ctx->advertised_window_size - size;
-            msgHeader.th_ack = ctx->last_ack_byte;
+            msgHeader.th_ack = ctx->last_ack_sent;
             msgHeader.th_flags = 0;
 
             if(stcp_network_send(sd,&msgHeader,sizeof(msgHeader),&read,size,NULL)>0){
@@ -296,7 +300,7 @@ static void control_loop(mysocket_t sd, context_t *ctx)
             msgHeader.th_seq = ctx->sequence_num;
             msgHeader.th_off = sizeof(msgHeader)/4;
             msgHeader.th_win = ctx->advertised_window_size;
-            msgHeader.th_ack = ctx->last_ack_byte;
+            msgHeader.th_ack = ctx->last_ack_received;
 
             stcp_network_send(sd,&msgHeader,sizeof(msgHeader),NULL);
         }
@@ -310,8 +314,8 @@ static void control_loop(mysocket_t sd, context_t *ctx)
             char recv[MAX_IP_PAYLOAD_LEN];
             memset(recv,0,sizeof(recv));
             int size = stcp_network_recv(sd,recv,sizeof(recv));
-            readMsgHeader = (STCPHeader *)recv;
 
+            readMsgHeader = (STCPHeader *)recv;
             int offset = readMsgHeader->th_off;
             offset = offset*4;
             
@@ -328,8 +332,8 @@ static void control_loop(mysocket_t sd, context_t *ctx)
                 if(debug)
                     printf("Got Ack for %d\n",readMsgHeader->th_ack);
                 ctx->sender_window_size = readMsgHeader->th_win;
-                ctx->advertised_window_size += (readMsgHeader->th_ack - ctx->last_ack_byte);
-                ctx->last_ack_byte = readMsgHeader->th_ack;               
+                ctx->advertised_window_size += (readMsgHeader->th_ack - ctx->last_ack_received);
+                ctx->last_ack_received = readMsgHeader->th_ack;               
             }
             else if(readMsgHeader->th_flags & TH_FIN){
                 /*
@@ -360,6 +364,8 @@ static void control_loop(mysocket_t sd, context_t *ctx)
                 ackMsgHeader->th_win = ctx->advertised_window_size;
                 ackMsgHeader->th_seq = ctx->sequence_num;
 
+                ctx->last_ack_sent = ackMsgHeader->th_ack;
+
                 stcp_fin_received(sd);
                 stcp_network_send(sd,ackMsgHeader, sizeof(STCPHeader),NULL); 
                 if(debug)
@@ -368,12 +374,13 @@ static void control_loop(mysocket_t sd, context_t *ctx)
             else{
                 
                 STCPHeader ackMsgHeader;
-                //ackMsgHeader = (STCPHeader *)malloc(sizeof(STCPHeader));
                 ackMsgHeader.th_flags = TH_ACK;
                 ackMsgHeader.th_ack = readMsgHeader->th_seq + (size-offset);
                 ackMsgHeader.th_off = (uint8_t)sizeof(STCPHeader)/4;
                 ackMsgHeader.th_win = ctx->advertised_window_size;
                 ackMsgHeader.th_seq = ctx->sequence_num;
+
+                ctx->last_ack_sent = ackMsgHeader.th_ack;
 
                 if(debug){
                     printf("Sent Ack for %d %d\n",readMsgHeader->th_seq,ackMsgHeader.th_ack);
@@ -385,11 +392,11 @@ static void control_loop(mysocket_t sd, context_t *ctx)
             stcp_app_send(sd,recv+offset,size-offset);
 
             if((ctx->connection_state==CLOSED) && 
-                (ctx->last_ack_byte==ctx->last_sent_byte+2)){
+                (ctx->last_ack_received==ctx->last_sent_byte+2)){
                 ctx->done=1;
             }
             if(debug && ctx->connection_state==CLOSED){
-                printf("HOLA %d %d\n",ctx->last_sent_byte,ctx->last_ack_byte);
+                printf("HOLA %d %d\n",ctx->last_sent_byte,ctx->last_ack_received);
             } 
         }       
         /* etc. */
