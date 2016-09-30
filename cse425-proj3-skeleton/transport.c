@@ -23,7 +23,8 @@
 
 enum { CSTATE_ESTABLISHED, FIN_SENT, FIN_RECEIVED, CLOSED };    /* you should have more states */
 
-#define debug 1
+#define debug 0
+
 int window_size = 3072;
 int max_payload_len = STCP_MSS;
 int MAX_IP_PAYLOAD_LEN = 1500;
@@ -53,7 +54,7 @@ static void control_loop(mysocket_t sd, context_t *ctx);
 // Adding a 1 sec increament
 timespec timeVal(timeval tv){
     timespec ts;
-    (ts).tv_sec = (tv).tv_sec + 1;
+    (ts).tv_sec = (tv).tv_sec + 5;
     (ts).tv_nsec = (tv).tv_usec * 1000;
     return ts;
 }
@@ -91,6 +92,7 @@ void transport_init(mysocket_t sd, bool_t is_active)
         STCPHeader synHeader;
         synHeader.th_seq = htonl(ctx->initial_sequence_num);
         synHeader.th_flags = TH_SYN;
+        synHeader.th_win = htons(ctx->advertised_window_size);
         int size = stcp_network_send(sd,&synHeader,sizeof(synHeader),NULL);
         
         gettimeofday(&tv,0);
@@ -105,31 +107,33 @@ void transport_init(mysocket_t sd, bool_t is_active)
             stcp_network_recv(sd,recv,sizeof(recv));
             recvSynAckHeader = (STCPHeader *)recv;
 
-            if(recvSynAckHeader->th_flags & (TH_SYN || TH_ACK)){
+            if(recvSynAckHeader->th_flags & (TH_SYN | TH_ACK)){
                 if(ntohl(recvSynAckHeader->th_ack)==ntohl(synHeader.th_seq)+1){
                     STCPHeader ackHeader;
                     ackHeader.th_flags = TH_ACK;
                     ackHeader.th_ack = htonl(ntohl(recvSynAckHeader->th_seq) + 1);
+                    ackHeader.th_win = htons(ctx->advertised_window_size);
                     stcp_network_send(sd,&ackHeader,sizeof(ackHeader),NULL);
 
                     ctx->sequence_num = ctx->initial_sequence_num + 1; 
                     ctx->last_ack_sent = ntohl(recvSynAckHeader->th_seq) + 1;
                     ctx->last_sent_byte = ctx->initial_sequence_num;
-                    ctx->last_ack_received = ctx->sequence_num;   
+                    ctx->last_ack_received = ctx->sequence_num;
+                    ctx->sender_window_size = ntohl(recvSynAckHeader->th_win);   
                 }
                 else{
                     printf("Active Ack Mismatch\n");
-                    exit(0);
+                    ctx->done=1;;
                 }
             }
             else{
                 printf("Active Flag Mismatch\n");
-                exit(0);
+                ctx->done=1;;
             }            
         }
         else{
             printf("Active Unexpected Event\n");
-            exit(0);
+            ctx->done=1;;
         }
      }
      else{
@@ -153,7 +157,8 @@ void transport_init(mysocket_t sd, bool_t is_active)
             STCPHeader synAckHeader;
             synAckHeader.th_seq = htonl(ctx->initial_sequence_num);
             synAckHeader.th_ack = htonl(ntohl(recvSynHeader->th_seq) + 1);
-            synAckHeader.th_flags = (TH_SYN || TH_ACK);
+            synAckHeader.th_flags = (TH_SYN | TH_ACK);
+            synAckHeader.th_win = htons(ctx->advertised_window_size);
             stcp_network_send(sd,&synAckHeader,sizeof(synAckHeader),NULL);
 
             gettimeofday(&tv,0);
@@ -170,22 +175,23 @@ void transport_init(mysocket_t sd, bool_t is_active)
                 if(recvAckHeader->th_flags & TH_ACK){
                     if(ntohl(recvAckHeader->th_ack) != (ntohl(synAckHeader.th_seq)+1)){
                         printf("Passive Ack Mismatch\n");
-                        exit(0);
+                        ctx->done=1;;
                     }
                     ctx->sequence_num = ctx->initial_sequence_num + 1;
                     ctx->last_ack_sent = ntohl(recvSynHeader->th_seq) + 1;
                     ctx->last_sent_byte = ctx->initial_sequence_num;
                     ctx->last_ack_received = ctx->sequence_num;
+                    ctx->sender_window_size = ntohl(recvSynHeader->th_win);
                 }
                 else{
                     printf("Passive Flag Mismatch\n");
-                    exit(0);
+                    ctx->done=1;;
                 }
             }
         }
         else{
             printf("Unexpected Event\n");
-            exit(0);
+            ctx->done=1;;
         }
      }
 
@@ -226,7 +232,7 @@ static void generate_initial_seq_num(context_t *ctx)
 static void control_loop(mysocket_t sd, context_t *ctx)
 {
     assert(ctx);
-    assert(!ctx->done);
+    //assert(!ctx->done); For server to not crash
 
     while (!ctx->done)
     {
@@ -363,7 +369,7 @@ static void control_loop(mysocket_t sd, context_t *ctx)
                 stcp_fin_received(sd);
                 stcp_network_send(sd,ackMsgHeader, sizeof(STCPHeader),NULL); 
                 if(debug)
-                    printf("Sent ACK/FIN-ACK for %d\n",ntohl(readMsgHeader->th_seq));             
+                    printf("Sent ACK/FIN-ACK for %d\n",ntohl(readMsgHeader->th_seq)+1);             
             }
             if(size > offset){
                 
