@@ -3,8 +3,11 @@
 Use Test Folder to host server and then checl from main folder(cse425-*)
 run client by
 ./client -q -f <filename> server_name:num
+In cae for abrupt closing of clinet, server times out
 
 ======= REMAINING =========
+
+hton() nton() what to you use ?
 
 What to do on a time out ?
 

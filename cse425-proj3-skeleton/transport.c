@@ -89,7 +89,7 @@ void transport_init(mysocket_t sd, bool_t is_active)
     timespec ts;
     if(is_active){
         STCPHeader synHeader;
-        synHeader.th_seq = ctx->initial_sequence_num;
+        synHeader.th_seq = htonl(ctx->initial_sequence_num);
         synHeader.th_flags = TH_SYN;
         int size = stcp_network_send(sd,&synHeader,sizeof(synHeader),NULL);
         
@@ -106,14 +106,14 @@ void transport_init(mysocket_t sd, bool_t is_active)
             recvSynAckHeader = (STCPHeader *)recv;
 
             if(recvSynAckHeader->th_flags & (TH_SYN || TH_ACK)){
-                if(recvSynAckHeader->th_ack==synHeader.th_seq+1){
+                if(ntohl(recvSynAckHeader->th_ack)==ntohl(synHeader.th_seq)+1){
                     STCPHeader ackHeader;
                     ackHeader.th_flags = TH_ACK;
-                    ackHeader.th_ack = recvSynAckHeader->th_seq + 1;
+                    ackHeader.th_ack = htonl(ntohl(recvSynAckHeader->th_seq) + 1);
                     stcp_network_send(sd,&ackHeader,sizeof(ackHeader),NULL);
 
                     ctx->sequence_num = ctx->initial_sequence_num + 1; 
-                    ctx->last_ack_sent = recvSynAckHeader->th_seq + 1;
+                    ctx->last_ack_sent = ntohl(recvSynAckHeader->th_seq) + 1;
                     ctx->last_sent_byte = ctx->initial_sequence_num;
                     ctx->last_ack_received = ctx->sequence_num;   
                 }
@@ -151,8 +151,8 @@ void transport_init(mysocket_t sd, bool_t is_active)
             recvSynHeader = (STCPHeader *)recv;
 
             STCPHeader synAckHeader;
-            synAckHeader.th_seq = ctx->initial_sequence_num;
-            synAckHeader.th_ack = recvSynHeader->th_seq + 1;
+            synAckHeader.th_seq = htonl(ctx->initial_sequence_num);
+            synAckHeader.th_ack = htonl(ntohl(recvSynHeader->th_seq) + 1);
             synAckHeader.th_flags = (TH_SYN || TH_ACK);
             stcp_network_send(sd,&synAckHeader,sizeof(synAckHeader),NULL);
 
@@ -166,13 +166,14 @@ void transport_init(mysocket_t sd, bool_t is_active)
                 char recv[MAX_IP_PAYLOAD_LEN];
                 stcp_network_recv(sd,recv,sizeof(recv));
                 recvAckHeader = (STCPHeader *)recv;
+
                 if(recvAckHeader->th_flags & TH_ACK){
-                    if(recvAckHeader->th_ack!=synAckHeader.th_seq+1){
+                    if(ntohl(recvAckHeader->th_ack) != (ntohl(synAckHeader.th_seq)+1)){
                         printf("Passive Ack Mismatch\n");
                         exit(0);
                     }
                     ctx->sequence_num = ctx->initial_sequence_num + 1;
-                    ctx->last_ack_sent = recvSynHeader->th_seq + 1;
+                    ctx->last_ack_sent = ntohl(recvSynHeader->th_seq) + 1;
                     ctx->last_sent_byte = ctx->initial_sequence_num;
                     ctx->last_ack_received = ctx->sequence_num;
                 }
@@ -271,14 +272,14 @@ static void control_loop(mysocket_t sd, context_t *ctx)
                 printf("Seq Num: %d App read size: %d\n",ctx->sequence_num,size);
 
             STCPHeader msgHeader;
-            msgHeader.th_seq = ctx->sequence_num;
+            msgHeader.th_seq = htonl(ctx->sequence_num);
             msgHeader.th_off = sizeof(msgHeader)/4;
-            msgHeader.th_win = ctx->advertised_window_size - size;
-            msgHeader.th_ack = ctx->last_ack_sent;
+            msgHeader.th_win = htons(ctx->advertised_window_size);
+            msgHeader.th_ack = htonl(ctx->last_ack_sent);
             msgHeader.th_flags = 0;
 
             if(stcp_network_send(sd,&msgHeader,sizeof(msgHeader),&read,size,NULL)>0){
-                ctx->advertised_window_size = msgHeader.th_win;
+                ctx->advertised_window_size = ntohs(msgHeader.th_win);
                 ctx->sequence_num = ctx->sequence_num + size;
                 ctx->last_sent_byte = ctx->sequence_num - 1;
                 //ctx->congestion_window_size -= (size+sizeof(msgHeader));
@@ -297,10 +298,12 @@ static void control_loop(mysocket_t sd, context_t *ctx)
             
             STCPHeader msgHeader;
             msgHeader.th_flags = TH_FIN;
-            msgHeader.th_seq = ctx->sequence_num;
+            msgHeader.th_seq = htonl(ctx->sequence_num);
             msgHeader.th_off = sizeof(msgHeader)/4;
-            msgHeader.th_win = ctx->advertised_window_size;
-            msgHeader.th_ack = ctx->last_ack_received;
+            msgHeader.th_win = htons(ctx->advertised_window_size);
+            msgHeader.th_ack = htonl(ctx->last_ack_received);
+
+            ctx->sequence_num += 1;
 
             stcp_network_send(sd,&msgHeader,sizeof(msgHeader),NULL);
         }
@@ -318,39 +321,30 @@ static void control_loop(mysocket_t sd, context_t *ctx)
             readMsgHeader = (STCPHeader *)recv;
             int offset = readMsgHeader->th_off;
             offset = offset*4;
-            
+            //int payload_size = size-offset;
+            offset = offset + MAX(0,ctx->last_ack_sent - ntohl(readMsgHeader->th_seq));
+            size = MIN(offset+ctx->advertised_window_size, size);
+
             if(debug){
                 printf("NETWORK_DATA Asking For...\n");
                 printf("Type of Request %d\n",readMsgHeader->th_flags);
-                printf("Seq No: %d Ack For: %d\n",readMsgHeader->th_seq, readMsgHeader->th_ack);
+                printf("Seq No: %d Ack For: %d\n",ntohl(readMsgHeader->th_seq), ntohl(readMsgHeader->th_ack));
                 printf("Received: %d, Offset: %d, recv+offset: %s\n",size,offset,recv+offset);                
             }
+            
+            
+
             assert(size >= offset);
-            if(size<0)
-                continue;
+            
             if(readMsgHeader->th_flags & TH_ACK){
                 if(debug)
-                    printf("Got Ack for %d\n",readMsgHeader->th_ack);
-                ctx->sender_window_size = readMsgHeader->th_win;
-                ctx->advertised_window_size += (readMsgHeader->th_ack - ctx->last_ack_received);
-                ctx->last_ack_received = readMsgHeader->th_ack;               
+                    printf("Got Ack for %d\n",ntohl(readMsgHeader->th_ack));
+                ctx->sender_window_size = ntohs(readMsgHeader->th_win);
+                ctx->advertised_window_size += (ntohl(readMsgHeader->th_ack) - ctx->last_ack_received);
+                ctx->last_ack_received = ntohl(readMsgHeader->th_ack);               
             }
-            else if(readMsgHeader->th_flags & TH_FIN){
-                /*
-                if(ctx->connection_state!=FIN_SENT){
-                    STCPHeader *finMsgHeader;
-                    finMsgHeader = (STCPHeader *)malloc(sizeof(STCPHeader));
-                    finMsgHeader->th_flags = TH_FIN;
-                    finMsgHeader->th_ack = readMsgHeader->th_seq + (size-offset);
-                    finMsgHeader->th_off = sizeof(STCPHeader)/4;
-                    finMsgHeader->th_win = ctx->advertised_window_size;
-                    finMsgHeader->th_seq = ctx->sequence_num;
-
-                    stcp_network_send(sd,finMsgHeader,sizeof(STCPHeader),NULL);
-                    if(debug)
-                        printf("Sent FIN/FIN-ACK for %d\n",readMsgHeader->th_seq);
-                }
-                */
+            if(readMsgHeader->th_flags & TH_FIN){
+                
                 if(ctx->connection_state==FIN_SENT)
                     ctx->connection_state=CLOSED;
                 else
@@ -359,32 +353,32 @@ static void control_loop(mysocket_t sd, context_t *ctx)
                 STCPHeader *ackMsgHeader;
                 ackMsgHeader = (STCPHeader *)malloc(sizeof(STCPHeader));
                 ackMsgHeader->th_flags = TH_ACK;
-                ackMsgHeader->th_ack = readMsgHeader->th_seq + (size-offset) + 1;
+                ackMsgHeader->th_ack = htonl(ntohl(readMsgHeader->th_seq) + (size-offset) + 1);
                 ackMsgHeader->th_off = sizeof(STCPHeader)/4;
-                ackMsgHeader->th_win = ctx->advertised_window_size;
-                ackMsgHeader->th_seq = ctx->sequence_num;
+                ackMsgHeader->th_win = htons(ctx->advertised_window_size);
+                ackMsgHeader->th_seq = htonl(ctx->sequence_num);
 
-                ctx->last_ack_sent = ackMsgHeader->th_ack;
+                ctx->last_ack_sent = ntohl(ackMsgHeader->th_ack);
 
                 stcp_fin_received(sd);
                 stcp_network_send(sd,ackMsgHeader, sizeof(STCPHeader),NULL); 
                 if(debug)
-                    printf("Sent ACK/FIN-ACK for %d\n",readMsgHeader->th_seq);             
+                    printf("Sent ACK/FIN-ACK for %d\n",ntohl(readMsgHeader->th_seq));             
             }
-            else{
+            if(size > offset){
                 
                 STCPHeader ackMsgHeader;
                 ackMsgHeader.th_flags = TH_ACK;
-                ackMsgHeader.th_ack = readMsgHeader->th_seq + (size-offset);
+                ackMsgHeader.th_ack = htonl(ntohl(readMsgHeader->th_seq) + (size-offset));
                 ackMsgHeader.th_off = (uint8_t)sizeof(STCPHeader)/4;
-                ackMsgHeader.th_win = ctx->advertised_window_size;
-                ackMsgHeader.th_seq = ctx->sequence_num;
+                ackMsgHeader.th_win = htons(ctx->advertised_window_size);
+                ackMsgHeader.th_seq = htonl(ctx->sequence_num);
 
-                ctx->last_ack_sent = ackMsgHeader.th_ack;
+                ctx->last_ack_sent = ntohl(ackMsgHeader.th_ack);
 
                 if(debug){
-                    printf("Sent Ack for %d %d\n",readMsgHeader->th_seq,ackMsgHeader.th_ack);
-                    printf("%d %d %d\n",ackMsgHeader.th_off, ackMsgHeader.th_seq, ackMsgHeader.th_flags);
+                    printf("Sent Ack for %d %d\n",ntohl(readMsgHeader->th_seq),ntohl(ackMsgHeader.th_ack));
+                    printf("%d %d %d\n",ackMsgHeader.th_off, ntohl(ackMsgHeader.th_seq), ackMsgHeader.th_flags);
                 }
 
                 stcp_network_send(sd,&ackMsgHeader, sizeof(STCPHeader),NULL);
@@ -398,6 +392,11 @@ static void control_loop(mysocket_t sd, context_t *ctx)
             if(debug && ctx->connection_state==CLOSED){
                 printf("HOLA %d %d\n",ctx->last_sent_byte,ctx->last_ack_received);
             } 
+        }
+
+        if(event==0){
+            ctx->done = 1;
+            printf("Connection TIMED OUT\n");
         }       
         /* etc. */
     }
